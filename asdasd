@@ -1,0 +1,678 @@
+# 0. Gerekli kütüphanelerin kurulması
+!pip install rarfile pyworld librosa requests
+
+# 1. Importlar ve Drive Mount
+import os
+import glob
+import math
+import json
+import requests
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+import rarfile
+import librosa
+from tqdm import tqdm
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# 2. RAR Dosyasının Çıkartılması (cem.rar içerisindeki .wav dosyaları)
+RAR_PATH = "/content/drive/MyDrive/model_ses_dosyaları/cem.rar"
+EXTRACT_DIR = "/content/drive/MyDrive/model_ses_dosyaları/cem_extracted"
+if not os.path.exists(EXTRACT_DIR):
+    os.makedirs(EXTRACT_DIR, exist_ok=True)
+    rf = rarfile.RarFile(RAR_PATH)
+    rf.extractall(path=EXTRACT_DIR)
+    print("RAR dosyası çıkartıldı:", EXTRACT_DIR)
+else:
+    print("RAR dosyası zaten çıkartılmış:", EXTRACT_DIR)
+
+# 3. HiFi‑GAN Dosyalarının Yüklenmesi (Drive'deki dosyalar kullanılacak)
+# Dosya yapınız: /content/drive/MyDrive/svc/hifigan/
+HIFIGAN_DIR = "/content/drive/MyDrive/svc/hifigan"
+CONFIG_PATH = os.path.join(HIFIGAN_DIR, "config.json")
+CHECKPOINT_PATH = os.path.join(HIFIGAN_DIR, "g_02500000")
+print("HiFi‑GAN config ve checkpoint dosya yolları ayarlandı:")
+print("Config:", CONFIG_PATH)
+print("Checkpoint:", CHECKPOINT_PATH)
+
+# Collate fonksiyonunda eksik padding kontrolü
+def collate_fn(batch):
+    batch = [item for item in batch if item["audio"].nelement() > 0]
+    if len(batch) == 0:
+        return None
+
+    audio_list = [item["audio"] for item in batch]
+    file_paths = [item["file_path"] for item in batch]
+
+    max_len = max(audio.shape[0] for audio in audio_list)
+    padded_audios = torch.zeros(len(audio_list), max_len)
+    
+    for i, audio in enumerate(audio_list):
+        if audio.dim() == 0:  # Boş tensor kontrolü
+            continue
+        padded_audios[i, :audio.shape[0]] = audio
+
+    return {
+        "audio": padded_audios.unsqueeze(1).to(device), # (B,1,T)
+        "file_path": file_paths
+    }
+
+
+# 4. Veri Ön İşleme Fonksiyonları ve Dataset Tanımlaması
+def trim_silence(waveform, top_db=20):
+    # Waveform: (1, T) -> (1, T')
+    np_wave = waveform.squeeze(0).numpy() # (T,) için
+    trimmed, _ = librosa.effects.trim(np_wave, top_db=top_db)
+    return torch.from_numpy(trimmed).unsqueeze(0) # (1, T')
+
+def augment_audio(waveform, sample_rate, n_steps=None):
+    # Waveform: (1, T) -> (1, T)
+    np_wave = waveform.squeeze(0).numpy()
+    if n_steps is None:
+        n_steps = np.random.choice([-2, -1, 1, 2])
+    augmented = librosa.effects.pitch_shift(np_wave, sr=sample_rate, n_steps=n_steps)
+    return torch.from_numpy(augmented).unsqueeze(0)
+
+class AudioDataset(Dataset):
+    def __init__(self, directory, target_sample_rate=22050, augment=False):
+        self.file_list = glob.glob(os.path.join(directory, "**", "*.wav"), recursive=True)
+        self.target_sample_rate = target_sample_rate
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_path = self.file_list[idx]
+        waveform, sr = torchaudio.load(file_path)
+
+        # Stereo -> Mono
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # Resample
+        if sr != self.target_sample_rate:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sample_rate)
+            waveform = resampler(waveform)
+
+        # Trim
+        waveform = trim_silence(waveform, top_db=20)
+        
+        # Boş ses kontrolü
+        if waveform.nelement() == 0:
+            return {"audio": torch.tensor([]), "file_path": file_path}
+
+        # Augment
+        if self.augment and np.random.rand() < 0.5:
+            waveform = augment_audio(waveform, self.target_sample_rate)
+
+        # Normalize
+        max_val = waveform.abs().max()
+        if max_val > 0:
+            waveform = waveform / (max_val + 1e-8)
+
+        return {"audio": waveform.squeeze(0).float(), "file_path": file_path} # (T,)
+
+        # Veri artırma (augment) uygula
+        if self.augment and np.random.rand() < 0.5:
+            waveform = augment_audio(waveform, self.target_sample_rate)
+
+        # Maksimum değere göre normalize et (sıfıra bölme hatasını önlemek için `+ 1e-8` eklendi)
+        max_val = waveform.abs().max()
+        if max_val > 0:
+            waveform = waveform / (max_val + 1e-8)
+
+        return {"audio": waveform.float(), "file_path": file_path}
+
+
+dataset = AudioDataset(directory=EXTRACT_DIR, target_sample_rate=22050, augment=True)
+train_dataloader = DataLoader(
+    dataset,
+    batch_size=4,
+    shuffle=True,
+    num_workers=2,  # Multiprocessing için 2-4 arası değer
+    pin_memory=True, # GPU'ya hızlı transfer
+    drop_last=True,
+    collate_fn=collate_fn
+)
+
+# 5. Diffüzyon Schedule Fonksiyonu
+def get_diffusion_schedule(diffusion_steps, beta_start=0.0001, beta_end=0.02):
+    betas = torch.linspace(beta_start, beta_end, diffusion_steps)
+    alphas = 1 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return betas, alpha_bars
+
+# 6. Orijinal Kod Yapılarının Entegrasyonu: SinusoidalPosEmb, ResidualBlock, DiffNet, GaussianDiffusion
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.half_dim = dim // 2
+        emb_factor = math.log(10000) / (self.half_dim - 1)
+        self.register_buffer('emb', torch.exp(torch.arange(self.half_dim).float() * -emb_factor))
+    def forward(self, x):
+        emb = x.unsqueeze(1) * self.emb.unsqueeze(0)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        return emb
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels, dilation):
+        super().__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        residual = x
+        x = self.relu(self.conv1(x))
+        x = self.conv2(x)
+        return self.relu(x + residual)
+
+class DiffNet(nn.Module):
+    def __init__(self, in_channels=128, num_layers=4):  # Giriş kanalı 128 olarak değişti
+        super().__init__()
+        self.input_conv = nn.Conv1d(in_channels, 128, kernel_size=3, padding=1)  # in_channels=128
+        self.pos_emb = SinusoidalPosEmb(128)
+        self.resblocks = nn.ModuleList([ResidualBlock(128, dilation=2**i) for i in range(num_layers)])
+        self.output_conv = nn.Conv1d(128, in_channels, kernel_size=3, padding=1)  # Çıkış 128
+
+    def forward(self, x, t):
+        t_emb = self.pos_emb(t)
+        t_emb = t_emb.unsqueeze(-1)
+        x = self.input_conv(x) + t_emb
+        for block in self.resblocks:
+            x = block(x)
+        x = self.output_conv(x)
+        return x
+
+class GaussianDiffusion(nn.Module):
+    def __init__(self, denoise_fn, diffusion_steps=1000, spec_min=-80.0, spec_max=0.0):
+        super().__init__()
+        self.denoise_fn = denoise_fn
+        self.diffusion_steps = diffusion_steps
+        betas, alpha_bars = get_diffusion_schedule(diffusion_steps)
+        self.register_buffer("alpha_bars", alpha_bars)
+        self.spec_min = spec_min
+        self.spec_max = spec_max
+    def forward(self, x, t):
+        alpha_bar = self.alpha_bars[t].view(-1, 1, 1)
+        noise = torch.randn_like(x)
+        noisy_x = torch.sqrt(alpha_bar) * x + torch.sqrt(1 - alpha_bar) * noise
+        pred_noise = self.denoise_fn(noisy_x, t)
+        return pred_noise, noise
+
+# 7. BEN.txt’ten Alınan Modüller: Mel Dönüşümü, F0 Çıkarımı, Özellik Çıkarıcı, Vocoder
+class OriginalMelTransformer(nn.Module):
+    def __init__(self, sample_rate=22050, n_fft=1024, hop_length=256, n_mels=80,
+                 win_length=1024, f_min=0.0, f_max=8000.0):
+        super().__init__()
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
+            win_length=win_length, f_min=f_min, f_max=f_max, n_mels=n_mels, power=2.0, normalized=True
+        )
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
+    def forward(self, audio_waveform):
+        mel_spec = self.mel_transform(audio_waveform)
+        mel_spec = self.amplitude_to_db(mel_spec)
+        return mel_spec
+
+class OriginalF0Extractor(nn.Module):
+    def __init__(self, sample_rate=22050, frame_period=5.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.frame_period = frame_period
+
+    def forward(self, audio_waveform):
+        import pyworld
+        audio_np = audio_waveform.cpu().numpy()
+        f0_list = []
+        
+        for wav in audio_np:
+            wav = wav.astype(np.float64)
+            _f0, t = pyworld.dio(wav, fs=self.sample_rate, frame_period=self.frame_period)
+            f0 = pyworld.stonemask(wav, _f0, t, self.sample_rate)
+            f0_tensor = torch.from_numpy(f0).float()
+            f0_list.append(f0_tensor)
+        
+        # Boyutları eşitle
+        f0_lengths = [len(f) for f in f0_list]
+        max_len = max(f0_lengths)
+        padded_f0 = torch.zeros(len(f0_list), max_len)
+        
+        for i, f in enumerate(f0_list):
+            padded_f0[i, :f0_lengths[i]] = f
+            
+        return padded_f0.unsqueeze(1).to(audio_waveform.device) # (B,1,T)
+
+class OriginalFeatureExtractor(nn.Module):
+    def __init__(self, n_mels=80, use_f0=False, hidden_channels=128, num_layers=4, 
+                 kernel_size=3, dropout=0.1):
+        super().__init__()
+        self.use_f0 = use_f0
+        in_channels = n_mels + 1 if use_f0 else n_mels
+        
+        layers = []
+        for _ in range(num_layers):
+            layers += [
+                nn.Conv1d(in_channels, hidden_channels, kernel_size, 
+                          padding=kernel_size//2),
+                nn.BatchNorm1d(hidden_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout)
+            ]
+            in_channels = hidden_channels
+            
+        self.cnn = nn.Sequential(*layers)
+
+    def forward(self, mel_spec, f0=None):
+        if self.use_f0 and f0 is not None:
+            # Mel: (B, n_mels, T), F0: (B,1,T')
+            # F0 interpolasyonu
+            f0 = F.interpolate(f0, size=mel_spec.shape[2], mode='linear', align_corners=False)
+            x = torch.cat([mel_spec, f0], dim=1) # (B, n_mels+1, T)
+        else:
+            x = mel_spec
+            
+        return self.cnn(x)
+
+
+# ResBlock1'in tam implementasyonu
+class ResBlock1(nn.Module):
+    def __init__(self, channels, kernel_size, dilations):
+        super().__init__()
+        self.convs1 = nn.ModuleList([
+            nn.utils.weight_norm(
+                nn.Conv1d(
+                    channels, 
+                    channels, 
+                    kernel_size, 
+                    padding=(kernel_size-1)*d//2, 
+                    dilation=d
+                )
+            ) for d in dilations
+        ])
+        self.convs2 = nn.ModuleList([
+            nn.utils.weight_norm(
+                nn.Conv1d(
+                    channels, 
+                    channels, 
+                    kernel_size, 
+                    padding=(kernel_size-1)*d//2, 
+                    dilation=d
+                )
+            ) for d in dilations
+        ])
+        self.leaky_relu = nn.LeakyReLU(0.1)
+
+    def forward(self, x):
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = self.leaky_relu(x)
+            xt = c1(xt)
+            xt = self.leaky_relu(xt)
+            xt = c2(xt)
+            x = xt + x
+        return x
+
+class HiFiGANGenerator(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Input convolution
+        self.conv_pre = nn.utils.weight_norm(
+            nn.Conv1d(
+                config["in_channels"],
+                config["upsample_initial_channel"],
+                kernel_size=7,
+                padding=3
+            )
+        )
+        
+        # Upsampling blocks
+        self.ups = nn.ModuleList()
+        self.resblocks = nn.ModuleList()
+        
+        current_ch = config["upsample_initial_channel"]
+        for i, (upsample_rate, kernel_size) in enumerate(zip(
+            config["upsample_rates"],
+            config["upsample_kernel_sizes"]
+        )):
+            # Upsample layer
+            up = nn.ConvTranspose1d(
+                current_ch,
+                current_ch // 2,
+                kernel_size=kernel_size,
+                stride=upsample_rate,
+                padding=(kernel_size - upsample_rate) // 2
+            )
+            self.ups.append(nn.utils.weight_norm(up))
+            
+            # Residual blocks for current resolution
+            resblock_group = nn.ModuleList()
+            for j in range(len(config["resblock_kernel_sizes"])):
+                resblock = ResBlock1(
+                    channels=current_ch // 2,
+                    kernel_size=config["resblock_kernel_sizes"][j],
+                    dilations=config["resblock_dilation_sizes"][j]
+                )
+                resblock_group.append(resblock)
+            
+            self.resblocks.append(resblock_group)
+            current_ch = current_ch // 2
+        
+        # Output convolution
+        self.conv_post = nn.utils.weight_norm(
+            nn.Conv1d(current_ch, 1, kernel_size=7, padding=3)
+        )
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        # Initial projection
+        x = self.conv_pre(x)
+        
+        # Upsampling stages
+        for up, resblock_group in zip(self.ups, self.resblocks):
+            x = F.leaky_relu(x, 0.1)
+            x = up(x)
+            
+            # Process through all residual blocks
+            xs = None
+            for resblock in resblock_group:
+                if xs is None:
+                    xs = resblock(x)
+                else:
+                    xs += resblock(x)
+            
+            # Average multi-receptive field outputs
+            x = xs / len(resblock_group)
+        
+        # Final output
+        x = self.tanh(self.conv_post(x))
+        return x.squeeze(1)
+
+def load_hifigan_generator(n_mels=80, config_path=CONFIG_PATH, checkpoint_path=CHECKPOINT_PATH):
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    config['in_channels'] = n_mels
+    generator = HiFiGANGenerator(config)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    
+    # Checkpoint'teki '_orig_mod.' prefix'lerini kaldır (Eğer varsa)
+    checkpoint['generator'] = {k.replace('_orig_mod.', ''): v for k,v in checkpoint['generator'].items()}
+    
+    generator.load_state_dict(checkpoint['generator'], strict=False)
+    generator.eval()
+    return generator
+
+class DiffSVC(nn.Module):
+    def __init__(self,
+                 sample_rate=22050,
+                 n_fft=1024,
+                 hop_length=256,
+                 n_mels=80,
+                 win_length=1024,
+                 f_min=0.0,
+                 f_max=8000.0,
+                 feat_hidden_channels=128,
+                 feat_layers=4,
+                 diffusion_steps=1000,
+                 use_f0=True,
+                 hifigan_config_path=CONFIG_PATH,
+                 hifigan_checkpoint_path=CHECKPOINT_PATH):
+        super(DiffSVC, self).__init__()
+        
+        # Mel Spectrogram Transformer
+        self.mel_transformer = OriginalMelTransformer(
+            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
+            win_length=win_length, f_min=f_min, f_max=f_max, n_mels=n_mels
+        )
+        
+        # F0 Extractor
+        self.f0_extractor = OriginalF0Extractor(sample_rate=sample_rate)
+        
+        # Feature Extractor
+        self.feature_extractor = OriginalFeatureExtractor(
+            n_mels=n_mels, 
+            use_f0=use_f0,
+            hidden_channels=feat_hidden_channels,
+            num_layers=feat_layers
+        )
+        
+        # Gaussian Diffusion Model
+        self.diffusion_steps = diffusion_steps
+        self.gaussian_diffusion = GaussianDiffusion(
+            denoise_fn=DiffNet(in_channels=128, num_layers=4),
+            diffusion_steps=diffusion_steps,
+            spec_min=-80.0,
+            spec_max=0.0
+        )
+        
+        # Projeksiyon Katmanları
+        self.feature_projection = nn.Conv1d(feat_hidden_channels, 128, kernel_size=1)
+        self.mel_projection = nn.Conv1d(128, 80, kernel_size=1)
+        
+        # HiFi-GAN Vocoder
+        self.vocoder = load_hifigan_generator(
+            n_mels=n_mels,
+            config_path=hifigan_config_path,
+            checkpoint_path=hifigan_checkpoint_path
+        )
+
+    def forward(self, audio_waveform, diffusion_t, noise=None):
+        # Mel spectrogram
+        mel_spec = self.mel_transformer(audio_waveform)
+        
+        # F0 extraction
+        f0 = self.f0_extractor(audio_waveform) if self.feature_extractor.use_f0 else None
+        
+        # Feature extraction
+        features = self.feature_extractor(mel_spec, f0)
+        
+        # Feature projection to 128 channels
+        projected_128 = self.feature_projection(features)
+        
+        # Diffusion process
+        if self.training:
+            t = diffusion_t.view(-1)
+            alpha_bar = self.gaussian_diffusion.alpha_bars[t].view(-1, 1, 1)  # Düzeltme
+            if noise is None:
+                noise = torch.randn_like(projected_128)
+            noisy_features = torch.sqrt(alpha_bar) * projected_128 + torch.sqrt(1 - alpha_bar) * noise
+            predicted_noise, _ = self.gaussian_diffusion(noisy_features, t)
+            diff_loss = F.mse_loss(predicted_noise, noise)
+        else:
+            diff_loss = None
+        
+        # Project back to 80 channels for vocoder
+        mel_projected = self.mel_projection(projected_128)
+        mel_recon_loss = F.l1_loss(mel_projected, mel_spec)
+        
+        # Generate waveform
+        waveform = self.vocoder(mel_projected)
+        return mel_spec, projected_128, waveform, diff_loss, mel_recon_loss
+    
+    def sample(self, audio_waveform, num_steps=None):
+        self.eval()
+        num_steps = num_steps if num_steps is not None else self.diffusion_steps
+        mel_spec = self.mel_transformer(audio_waveform)
+        f0 = self.f0_extractor(audio_waveform) if self.feature_extractor.use_f0 else None
+        features = self.feature_extractor(mel_spec, f0)
+        x = features
+        for t in reversed(range(num_steps)):
+            t_tensor = torch.full((x.size(0),), t, device=x.device, dtype=torch.long)
+            predicted_noise = self.gaussian_diffusion.denoise_fn(x, t_tensor)
+            alpha_bar = self.gaussian_diffusion.alpha_bars[t]  # Düzeltme
+            x = (x - math.sqrt(1 - alpha_bar) * predicted_noise) / math.sqrt(alpha_bar)
+        projected = self.feature_projection(x)
+        waveform = self.vocoder(projected)
+        return waveform
+
+# 9. Discriminator
+class Discriminator(nn.Module):
+    def __init__(self, input_channels=1):
+        super(Discriminator, self).__init__()
+        self.conv1 = nn.Conv1d(input_channels, 16, kernel_size=15, stride=1, padding=7)
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=41, stride=4, padding=20, groups=4)
+        self.conv3 = nn.Conv1d(32, 64, kernel_size=41, stride=4, padding=20, groups=4)
+        self.conv4 = nn.Conv1d(64, 128, kernel_size=41, stride=4, padding=20, groups=4)
+        self.conv5 = nn.Conv1d(128, 256, kernel_size=5, stride=1, padding=2)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.fc = nn.Linear(256, 1)
+    def forward(self, x):
+        x = self.leaky_relu(self.conv1(x))
+        x = self.leaky_relu(self.conv2(x))
+        x = self.leaky_relu(self.conv3(x))
+        x = self.leaky_relu(self.conv4(x))
+        x = self.leaky_relu(self.conv5(x))
+        x = torch.mean(x, dim=2)
+        x = self.fc(x)
+        return x
+
+# 10. Eğitim Ayarları ve Eğitim Döngüsü
+learning_rate = 2e-4
+betas = (0.9, 0.999)
+weight_decay = 1e-6
+num_epochs = 50
+warmup_steps = 500
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = DiffSVC(
+    sample_rate=22050,
+    n_fft=1024,
+    hop_length=256,
+    n_mels=80,
+    win_length=1024,
+    f_min=0.0,
+    f_max=8000.0,
+    feat_hidden_channels=128,
+    feat_layers=4,
+    diffusion_steps=1000,
+    use_f0=True,
+    hifigan_config_path=CONFIG_PATH,
+    hifigan_checkpoint_path=CHECKPOINT_PATH
+)
+model = model.to(device)
+disc = Discriminator().to(device)
+
+optimizer_G = optim.AdamW(
+    model.parameters(), 
+    lr=learning_rate, 
+    betas=betas, 
+    weight_decay=weight_decay,
+    eps=1e-6  # Numerik stabilite için
+)
+
+optimizer_D = optim.AdamW(disc.parameters(), lr=learning_rate, betas=betas, weight_decay=weight_decay)
+
+
+scheduler_G = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer_G, 
+    max_lr=learning_rate,
+    total_steps=num_epochs*len(train_dataloader),
+    pct_start=0.1
+)
+
+adv_loss_fn = nn.BCEWithLogitsLoss()
+mel_loss_fn = nn.L1Loss()
+
+save_dir = "/content/drive/MyDrive/svc"
+os.makedirs(save_dir, exist_ok=True)
+
+print("Eğitime başlanıyor...")
+global_step = 0
+for epoch in range(num_epochs):
+    model.train()
+    disc.train()
+    running_loss_G = 0.0
+    running_loss_D = 0.0
+    pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+    
+    for batch in pbar:
+        if batch is None:
+            continue
+
+        # Veri hazırlama (Yeni collate_fn ile gelen format)
+        padded_audios = batch["audio"].to(device)  # (B,1,T)
+        file_paths = batch["file_path"]
+        batch_size = padded_audios.size(0)
+
+        # Zaman adımlarını rastgele seç
+        diffusion_t = torch.randint(0, model.diffusion_steps, (batch_size,), device=device)
+        
+        # 1. GENERATOR GÜNCELLEME
+        optimizer_G.zero_grad()
+        
+        # Model forward (Yeni boyut uyumlu versiyon)
+        mel_spec, features, waveform, diff_loss, mel_recon_loss = model(
+            padded_audios.squeeze(1),  # (B,T) olarak besle
+            diffusion_t
+        )
+        
+        # Adversarial loss (Waveform boyut düzeltmesi)
+        pred_fake = disc(waveform.unsqueeze(1))  # (B,1,T) yap
+        valid = torch.ones_like(pred_fake, device=device)
+        adv_loss = adv_loss_fn(pred_fake, valid)
+        
+        # Toplam loss
+        loss_G = diff_loss + mel_recon_loss + 0.001 * adv_loss
+        loss_G.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer_G.step()
+        
+        # 2. DISCRIMINATOR GÜNCELLEME
+        optimizer_D.zero_grad()
+        
+        # Gerçek sesler (Yeni boyut formatıyla)
+        pred_real = disc(padded_audios)  # Zaten (B,1,T)
+        real_loss = adv_loss_fn(pred_real, valid)
+        
+        # Sahte sesler (Detach edilmiş)
+        with torch.no_grad():
+            _, _, waveform, _, _ = model(padded_audios.squeeze(1), diffusion_t)
+        
+        pred_fake = disc(waveform.unsqueeze(1).detach())
+        fake = torch.zeros_like(pred_fake, device=device)
+        fake_loss = adv_loss_fn(pred_fake, fake)
+        
+        # Disc loss
+        loss_D = (real_loss + fake_loss) / 2
+        loss_D.backward()
+        torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
+        optimizer_D.step()
+        
+        # İlerleme takibi
+        global_step += 1
+        running_loss_G += loss_G.item() * batch_size
+        running_loss_D += loss_D.item() * batch_size
+        pbar.set_postfix(
+            loss_G=f"{loss_G.item():.4f}", 
+            loss_D=f"{loss_D.item():.4f}", 
+            lr=f"{optimizer_G.param_groups[0]['lr']:.6f}"
+        )
+    
+    # Epoch sonu işlemleri
+    scheduler_G.step()
+    epoch_loss_G = running_loss_G / len(train_dataloader.dataset)
+    epoch_loss_D = running_loss_D / len(train_dataloader.dataset)
+    print(f"Epoch [{epoch+1}/{num_epochs}] Loss_G: {epoch_loss_G:.4f} | Loss_D: {epoch_loss_D:.4f}")
+    
+    # Model kaydetme
+    checkpoint_path = os.path.join(save_dir, f"diffsvc_epoch_{epoch+1}.pth")
+    torch.save({
+        'model': model.state_dict(),
+        'disc': disc.state_dict(),
+        'optimizer_G': optimizer_G.state_dict(),
+        'optimizer_D': optimizer_D.state_dict(),
+        'epoch': epoch+1
+    }, checkpoint_path)
+    print(f"Checkpoint kaydedildi: {checkpoint_path}")
+
+print("Eğitim tamamlandı.")
